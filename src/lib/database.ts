@@ -110,35 +110,34 @@ export const databasePromise = (async () => {
     return doc;
   }, true);
 
-  await database.todos.bulkInsert(
-    [
-      "touch your 👃 with your 👅",
-      "solve rubik's cube 🎲 blindfolded",
-      "invent new 🍔",
-    ].map((name, idx) => ({
-      id: "todo-" + idx,
-      name,
-      lastChange: 0,
-      state: "open",
-    }))
-  );
-
   // Set up HTTP replication
   const httpReplicationState = await replicateRxCollection({
     collection: database.todos,
     replicationIdentifier: "http-todos",
     pull: {
       handler: async (lastCheckpoint) => {
-        const response = await fetch(
-          `http://localhost:3000/todos?lastCheckpoint=${lastCheckpoint}`
-        );
+        try {
+          const response = await fetch(
+            `/api/todos/pull?lastCheckpoint=${lastCheckpoint}`
+          );
 
-        const docs = await response.json();
+          if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+          }
 
-        return {
-          documents: docs,
-          checkpoint: Date.now(),
-        };
+          const docs = await response.json();
+
+          return {
+            documents: docs,
+            checkpoint: Date.now(),
+          };
+        } catch (error) {
+          console.error("Pull replication error:", error);
+          return {
+            documents: [],
+            checkpoint: lastCheckpoint,
+          };
+        }
       },
     },
     push: {
@@ -146,45 +145,25 @@ export const databasePromise = (async () => {
         docs: RxReplicationWriteToMasterRow<TodoDocType>[]
       ) => {
         console.log("pushing docs", docs);
-        const results = await Promise.all(
-          docs.map(async (doc) => {
-            const { newDocumentState, assumedMasterState } = doc;
+        try {
+          const response = await fetch("/api/todos/push", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(docs),
+          });
 
-            if (newDocumentState._deleted) {
-              await fetch(
-                `http://localhost:3000/todos/${newDocumentState.id}`,
-                {
-                  method: "DELETE",
-                }
-              );
+          if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+          }
 
-              return {
-                ...newDocumentState,
-                _deleted: true,
-              };
-            }
-
-            const method = assumedMasterState ? "PUT" : "POST";
-            const url =
-              method === "POST"
-                ? "http://localhost:3000/todos"
-                : `http://localhost:3000/todos/${newDocumentState.id}`;
-
-            await fetch(url, {
-              method,
-              headers: {
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify(newDocumentState),
-            });
-
-            return {
-              ...newDocumentState,
-              _deleted: false,
-            };
-          })
-        );
-        return results;
+          const results = await response.json();
+          return results;
+        } catch (error) {
+          console.error("Push replication error:", error);
+          throw error;
+        }
       },
     },
   });

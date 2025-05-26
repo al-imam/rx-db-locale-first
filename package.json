@@ -8,7 +8,7 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "server": "tsx server.js"
+    "server": "tsx --watch server.ts"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.1.7",

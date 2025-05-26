@@ -1,8 +1,12 @@
 import bodyParser from "body-parser";
 import cors from "cors";
 import express from "express";
-import { createRxDatabase } from "rxdb/plugins/core";
+import { addRxPlugin, createRxDatabase } from "rxdb/plugins/core";
+import { RxDBQueryBuilderPlugin } from "rxdb/plugins/query-builder";
 import { getRxStorageMemory } from "rxdb/plugins/storage-memory";
+
+// Add the query builder plugin
+addRxPlugin(RxDBQueryBuilderPlugin);
 
 const app = express();
 app.use(cors());
@@ -50,29 +54,76 @@ await serverDb.addCollections({
   },
 });
 
-// API endpoints
-app.get("/todos", async (req, res) => {
-  const todos = await serverDb.todos.find().exec();
-  res.json(todos);
+serverDb.todos.$.subscribe((change) => {
+  console.log(change);
 });
 
-app.post("/todos", async (req, res) => {
-  const todo = req.body;
-  await serverDb.todos.insert(todo);
-  res.json(todo);
+// Pull endpoint - get all documents since last checkpoint
+app.get("/todos/pull", async (req, res) => {
+  try {
+    const lastCheckpoint =
+      parseInt(req.query.lastCheckpoint as string) || 0;
+    const todos = await serverDb.todos
+      .find()
+      .where("lastChange")
+      .gt(lastCheckpoint)
+      .exec();
+    res.json(todos);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
-app.put("/todos/:id", async (req, res) => {
-  const { id } = req.params;
-  const todo = req.body;
-  await serverDb.todos.findOne(id).update(todo);
-  res.json(todo);
-});
+// Push endpoint - handle all document changes
+app.post("/todos/push", async (req, res) => {
+  try {
+    const changes = req.body;
+    if (!Array.isArray(changes)) {
+      return res
+        .status(400)
+        .json({ error: "Expected array of changes" });
+    }
 
-app.delete("/todos/:id", async (req, res) => {
-  const { id } = req.params;
-  await serverDb.todos.findOne(id).remove();
-  res.json({ success: true });
+    const results = await Promise.all(
+      changes.map(async (change) => {
+        const { newDocumentState } = change;
+
+        // Handle deleted documents
+        if (newDocumentState._deleted) {
+          const existingTodo = await serverDb.todos
+            .findOne(newDocumentState.id)
+            .exec();
+          if (existingTodo) {
+            await existingTodo.remove();
+          }
+          return { ...newDocumentState, _deleted: true };
+        }
+
+        // Handle document updates/inserts
+        const existingTodo = await serverDb.todos
+          .findOne(newDocumentState.id)
+          .exec();
+
+        if (existingTodo) {
+          // If document exists, update if the new version is newer
+          if (newDocumentState.lastChange > existingTodo.lastChange) {
+            await existingTodo.update(newDocumentState);
+          }
+        } else {
+          // If document doesn't exist, insert it
+          await serverDb.todos.insert(newDocumentState);
+        }
+
+        return { ...newDocumentState, _deleted: false };
+      })
+    );
+
+    res.json(results);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
