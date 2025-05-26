@@ -8,8 +8,10 @@ import {
   type RxConflictHandler,
   RXDB_VERSION,
   type RxJsonSchema,
+  type RxReplicationWriteToMasterRow,
   type RxStorage,
 } from "rxdb/plugins/core";
+import { replicateRxCollection } from "rxdb/plugins/replication";
 import {
   getConnectionHandlerSimplePeer,
   replicateWebRTC,
@@ -121,20 +123,93 @@ export const databasePromise = (async () => {
     }))
   );
 
-  replicateWebRTC<TodoDocType, SimplePeer>({
+  // Set up HTTP replication
+  const httpReplicationState = await replicateRxCollection({
+    collection: database.todos,
+    replicationIdentifier: "http-todos",
+    pull: {
+      handler: async (lastCheckpoint) => {
+        const response = await fetch(
+          `http://localhost:3000/todos?lastCheckpoint=${lastCheckpoint}`
+        );
+
+        const docs = await response.json();
+
+        return {
+          documents: docs,
+          checkpoint: Date.now(),
+        };
+      },
+    },
+    push: {
+      handler: async (
+        docs: RxReplicationWriteToMasterRow<TodoDocType>[]
+      ) => {
+        console.log("pushing docs", docs);
+        const results = await Promise.all(
+          docs.map(async (doc) => {
+            const { newDocumentState, assumedMasterState } = doc;
+
+            if (newDocumentState._deleted) {
+              await fetch(
+                `http://localhost:3000/todos/${newDocumentState.id}`,
+                {
+                  method: "DELETE",
+                }
+              );
+
+              return {
+                ...newDocumentState,
+                _deleted: true,
+              };
+            }
+
+            const method = assumedMasterState ? "PUT" : "POST";
+            const url =
+              method === "POST"
+                ? "http://localhost:3000/todos"
+                : `http://localhost:3000/todos/${newDocumentState.id}`;
+
+            await fetch(url, {
+              method,
+              headers: {
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify(newDocumentState),
+            });
+
+            return {
+              ...newDocumentState,
+              _deleted: false,
+            };
+          })
+        );
+        return results;
+      },
+    },
+  });
+
+  const webrtcReplicationState = await replicateWebRTC<
+    TodoDocType,
+    SimplePeer
+  >({
     collection: database.todos,
     connectionHandlerCreator: getConnectionHandlerSimplePeer({}),
     topic: roomHash.substring(0, 10),
     pull: {},
     push: {},
-  }).then((replicationState) => {
-    replicationState.error$.subscribe((err: unknown) => {
-      console.log("replication error:", err);
-    });
+  });
 
-    replicationState.peerStates$.subscribe((s) => {
-      console.log("new peer states:", s);
-    });
+  httpReplicationState.error$.subscribe((err) => {
+    console.error("HTTP replication error:", err);
+  });
+
+  webrtcReplicationState.error$.subscribe((err) => {
+    console.error("WebRTC replication error:", err);
+  });
+
+  webrtcReplicationState.peerStates$.subscribe((s) => {
+    console.log("new peer states:", s);
   });
 
   return database;
