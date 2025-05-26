@@ -1,9 +1,15 @@
 import bodyParser from "body-parser";
 import cors from "cors";
 import express from "express";
-import { addRxPlugin, createRxDatabase } from "rxdb/plugins/core";
+import {
+  addRxPlugin,
+  createRxDatabase,
+  lastOfArray,
+} from "rxdb/plugins/core";
 import { RxDBQueryBuilderPlugin } from "rxdb/plugins/query-builder";
 import { getRxStorageMemory } from "rxdb/plugins/storage-memory";
+import { Subject } from "rxjs";
+import type { TodoDocType } from "./src/types/todo";
 
 // Add the query builder plugin
 addRxPlugin(RxDBQueryBuilderPlugin);
@@ -54,21 +60,61 @@ await serverDb.addCollections({
   },
 });
 
+interface ReplicationEvent {
+  documents: TodoDocType[];
+  checkpoint: {
+    id: string;
+    updatedAt: number;
+  } | null;
+}
+
+// Create a Subject for real-time updates
+const pullStream$ = new Subject<ReplicationEvent>();
+
+// Subscribe to all changes in the todos collection
 serverDb.todos.$.subscribe((change) => {
-  console.log(change);
+  pullStream$.next({
+    documents: [change.documentData],
+    checkpoint: {
+      id: change.documentData.id,
+      updatedAt: change.documentData.lastChange,
+    },
+  });
 });
 
 // Pull endpoint - get all documents since last checkpoint
 app.get("/todos/pull", async (req, res) => {
   try {
-    const lastCheckpoint =
-      parseInt(req.query.lastCheckpoint as string) || 0;
+    const updatedAt = parseFloat(req.query.updatedAt as string) || 0;
+    const id = (req.query.id as string) || "";
+    const batchSize = parseInt(req.query.batchSize as string) || 100;
+
     const todos = await serverDb.todos
-      .find()
-      .where("lastChange")
-      .gt(lastCheckpoint)
+      .find({
+        selector: {
+          $or: [
+            { lastChange: { $gt: updatedAt } },
+            {
+              lastChange: { $eq: updatedAt },
+              id: { $gt: id },
+            },
+          ],
+        },
+        sort: [{ lastChange: "asc" }, { id: "asc" }],
+        limit: batchSize,
+      })
       .exec();
-    res.json(todos);
+
+    const documents = todos.map((todo) => todo.toJSON());
+    const checkpoint =
+      documents.length === 0
+        ? { id, updatedAt }
+        : {
+            id: lastOfArray(documents).id,
+            updatedAt: lastOfArray(documents).lastChange,
+          };
+
+    res.json({ documents, checkpoint });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: error.message });
@@ -85,45 +131,68 @@ app.post("/todos/push", async (req, res) => {
         .json({ error: "Expected array of changes" });
     }
 
-    const results = await Promise.all(
-      changes.map(async (change) => {
-        const { newDocumentState } = change;
+    const conflicts: TodoDocType[] = [];
+    const event: ReplicationEvent = {
+      documents: [],
+      checkpoint: null,
+    };
 
-        // Handle deleted documents
-        if (newDocumentState._deleted) {
-          const existingTodo = await serverDb.todos
-            .findOne(newDocumentState.id)
-            .exec();
-          if (existingTodo) {
-            await existingTodo.remove();
-          }
-          return { ...newDocumentState, _deleted: true };
-        }
+    for (const change of changes) {
+      const { newDocumentState, assumedMasterState } = change;
+      const existingTodo = await serverDb.todos
+        .findOne(newDocumentState.id)
+        .exec();
 
-        // Handle document updates/inserts
-        const existingTodo = await serverDb.todos
-          .findOne(newDocumentState.id)
-          .exec();
-
+      // Check for conflicts
+      if (
+        existingTodo &&
+        (!assumedMasterState ||
+          existingTodo.lastChange !== assumedMasterState.lastChange)
+      ) {
+        conflicts.push(existingTodo.toJSON());
+      } else {
+        // No conflict, update or insert
         if (existingTodo) {
-          // If document exists, update if the new version is newer
-          if (newDocumentState.lastChange > existingTodo.lastChange) {
-            await existingTodo.update(newDocumentState);
-          }
+          await existingTodo.update(newDocumentState);
         } else {
-          // If document doesn't exist, insert it
           await serverDb.todos.insert(newDocumentState);
         }
 
-        return { ...newDocumentState, _deleted: false };
-      })
-    );
+        event.documents.push(newDocumentState);
+        event.checkpoint = {
+          id: newDocumentState.id,
+          updatedAt: newDocumentState.lastChange,
+        };
+      }
+    }
 
-    res.json(results);
+    // Emit event for real-time updates
+    if (event.documents.length > 0) {
+      pullStream$.next(event);
+    }
+
+    res.json(conflicts);
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: error.message });
   }
+});
+
+// Server-Sent Events endpoint for real-time updates
+app.get("/todos/pullStream", (req, res) => {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    Connection: "keep-alive",
+    "Cache-Control": "no-cache",
+  });
+
+  const subscription = pullStream$.subscribe((event) => {
+    res.write(`data: ${JSON.stringify(event)}\n\n`);
+  });
+
+  req.on("close", () => {
+    subscription.unsubscribe();
+  });
 });
 
 const PORT = process.env.PORT || 3000;

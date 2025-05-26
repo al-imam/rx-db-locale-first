@@ -8,6 +8,7 @@ import {
   type RxConflictHandler,
   RXDB_VERSION,
   type RxJsonSchema,
+  type RxReplicationPullStreamItem,
   type RxReplicationWriteToMasterRow,
   type RxStorage,
 } from "rxdb/plugins/core";
@@ -18,6 +19,7 @@ import {
   type SimplePeer,
 } from "rxdb/plugins/replication-webrtc";
 import { getRxStorageDexie } from "rxdb/plugins/storage-dexie";
+import { Observable } from "rxjs";
 import { type TodoDocType } from "../types/todo";
 
 let storage: RxStorage<unknown, unknown> = getRxStorageDexie();
@@ -115,21 +117,24 @@ export const databasePromise = (async () => {
     collection: database.todos,
     replicationIdentifier: "http-todos",
     pull: {
-      handler: async (lastCheckpoint) => {
+      handler: async (lastCheckpoint, batchSize) => {
         try {
+          const checkpoint = (lastCheckpoint as {
+            id: string;
+            updatedAt: number;
+          }) || { id: "", updatedAt: 0 };
           const response = await fetch(
-            `/api/todos/pull?lastCheckpoint=${lastCheckpoint}`
+            `/api/todos/pull?updatedAt=${checkpoint.updatedAt}&id=${checkpoint.id}&batchSize=${batchSize}`
           );
 
           if (!response.ok) {
             throw new Error(`HTTP error! status: ${response.status}`);
           }
 
-          const docs = await response.json();
-
+          const data = await response.json();
           return {
-            documents: docs,
-            checkpoint: Date.now(),
+            documents: data.documents,
+            checkpoint: data.checkpoint,
           };
         } catch (error) {
           console.error("Pull replication error:", error);
@@ -139,12 +144,39 @@ export const databasePromise = (async () => {
           };
         }
       },
+      stream$: new Observable<
+        RxReplicationPullStreamItem<
+          TodoDocType,
+          { id: string; updatedAt: number }
+        >
+      >((subscriber) => {
+        const eventSource = new EventSource("/api/todos/pullStream");
+
+        eventSource.onmessage = (event) => {
+          const data = JSON.parse(event.data);
+          if (data === "RESYNC") {
+            subscriber.next("RESYNC");
+          } else {
+            subscriber.next({
+              documents: data.documents,
+              checkpoint: data.checkpoint,
+            });
+          }
+        };
+
+        eventSource.onerror = () => {
+          subscriber.next("RESYNC");
+        };
+
+        return () => {
+          eventSource.close();
+        };
+      }),
     },
     push: {
       handler: async (
         docs: RxReplicationWriteToMasterRow<TodoDocType>[]
       ) => {
-        console.log("pushing docs", docs);
         try {
           const response = await fetch("/api/todos/push", {
             method: "POST",
@@ -158,14 +190,22 @@ export const databasePromise = (async () => {
             throw new Error(`HTTP error! status: ${response.status}`);
           }
 
-          const results = await response.json();
-          return results;
+          const conflicts = await response.json();
+          return conflicts;
         } catch (error) {
           console.error("Push replication error:", error);
           throw error;
         }
       },
     },
+  });
+
+  httpReplicationState.error$.subscribe((err) => {
+    console.error("HTTP replication error:", err);
+  });
+
+  httpReplicationState.active$.subscribe((active) => {
+    console.log("HTTP replication active:", active);
   });
 
   const webrtcReplicationState = await replicateWebRTC<
@@ -177,10 +217,6 @@ export const databasePromise = (async () => {
     topic: roomHash.substring(0, 10),
     pull: {},
     push: {},
-  });
-
-  httpReplicationState.error$.subscribe((err) => {
-    console.error("HTTP replication error:", err);
   });
 
   webrtcReplicationState.error$.subscribe((err) => {
