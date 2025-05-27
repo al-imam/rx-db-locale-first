@@ -6,25 +6,29 @@ import {
   createRxDatabase,
   lastOfArray,
 } from "rxdb/plugins/core";
+import { RxDBDevModePlugin } from "rxdb/plugins/dev-mode";
 import { RxDBQueryBuilderPlugin } from "rxdb/plugins/query-builder";
 import { getRxStorageMemory } from "rxdb/plugins/storage-memory";
+import { RxDBUpdatePlugin } from "rxdb/plugins/update";
+import { wrappedValidateAjvStorage } from "rxdb/plugins/validate-ajv";
 import { Subject } from "rxjs";
 import type { TodoDocType } from "./src/types/todo";
 
-// Add the query builder plugin
 addRxPlugin(RxDBQueryBuilderPlugin);
+addRxPlugin(RxDBUpdatePlugin);
+addRxPlugin(RxDBDevModePlugin);
 
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// Create an in-memory database for the server
 const serverDb = await createRxDatabase({
   name: "serverdb",
-  storage: getRxStorageMemory(),
+  storage: wrappedValidateAjvStorage({
+    storage: getRxStorageMemory(),
+  }),
 });
 
-// Define the todo collection schema
 const todoSchema = {
   version: 0,
   primaryKey: "id",
@@ -53,7 +57,6 @@ const todoSchema = {
   indexes: ["state", ["state", "lastChange"]],
 };
 
-// Create the todos collection
 await serverDb.addCollections({
   todos: {
     schema: todoSchema,
@@ -68,10 +71,8 @@ interface ReplicationEvent {
   } | null;
 }
 
-// Create a Subject for real-time updates
 const pullStream$ = new Subject<ReplicationEvent>();
 
-// Subscribe to all changes in the todos collection
 serverDb.todos.$.subscribe((change) => {
   pullStream$.next({
     documents: [change.documentData],
@@ -82,7 +83,6 @@ serverDb.todos.$.subscribe((change) => {
   });
 });
 
-// Pull endpoint - get all documents since last checkpoint
 app.get("/todos/pull", async (req, res) => {
   try {
     const updatedAt = parseFloat(req.query.updatedAt as string) || 0;
@@ -94,10 +94,7 @@ app.get("/todos/pull", async (req, res) => {
         selector: {
           $or: [
             { lastChange: { $gt: updatedAt } },
-            {
-              lastChange: { $eq: updatedAt },
-              id: { $gt: id },
-            },
+            { lastChange: { $eq: updatedAt }, id: { $gt: id } },
           ],
         },
         sort: [{ lastChange: "asc" }, { id: "asc" }],
@@ -121,7 +118,6 @@ app.get("/todos/pull", async (req, res) => {
   }
 });
 
-// Push endpoint - handle all document changes
 app.post("/todos/push", async (req, res) => {
   try {
     const changes = req.body;
@@ -143,7 +139,6 @@ app.post("/todos/push", async (req, res) => {
         .findOne(newDocumentState.id)
         .exec();
 
-      // Check for conflicts
       if (
         existingTodo &&
         (!assumedMasterState ||
@@ -151,9 +146,10 @@ app.post("/todos/push", async (req, res) => {
       ) {
         conflicts.push(existingTodo.toJSON());
       } else {
-        // No conflict, update or insert
         if (existingTodo) {
-          await existingTodo.update(newDocumentState);
+          await existingTodo.update({
+            $set: newDocumentState,
+          });
         } else {
           await serverDb.todos.insert(newDocumentState);
         }
@@ -166,7 +162,6 @@ app.post("/todos/push", async (req, res) => {
       }
     }
 
-    // Emit event for real-time updates
     if (event.documents.length > 0) {
       pullStream$.next(event);
     }
@@ -178,7 +173,6 @@ app.post("/todos/push", async (req, res) => {
   }
 });
 
-// Server-Sent Events endpoint for real-time updates
 app.get("/todos/pullStream", (req, res) => {
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -196,6 +190,7 @@ app.get("/todos/pullStream", (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });

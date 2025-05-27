@@ -19,7 +19,7 @@ import {
   type SimplePeer,
 } from "rxdb/plugins/replication-webrtc";
 import { getRxStorageDexie } from "rxdb/plugins/storage-dexie";
-import { Observable } from "rxjs";
+import { Observable, Subject } from "rxjs";
 import { type TodoDocType } from "../types/todo";
 
 let storage: RxStorage<unknown, unknown> = getRxStorageDexie();
@@ -107,15 +107,69 @@ export const databasePromise = (async () => {
     },
   });
 
-  database.todos.preSave((doc) => {
-    doc.lastChange = Date.now();
-    return doc;
-  }, true);
+  database.todos.preSave(
+    (doc) => ({ ...doc, lastChange: Date.now() }),
+    true
+  );
 
-  // Set up HTTP replication
-  const httpReplicationState = await replicateRxCollection({
+  replicateWebRTC<TodoDocType, SimplePeer>({
+    collection: database.todos,
+    connectionHandlerCreator: getConnectionHandlerSimplePeer({}),
+    topic: roomHash.substring(0, 10),
+    pull: {},
+    push: {},
+  }).then((replicationState) => {
+    replicationState.error$.subscribe((err: unknown) => {
+      console.log("replication error:");
+      console.dir(err);
+    });
+    replicationState.peerStates$.subscribe((s) => {
+      console.log("new peer states:");
+      console.dir(s);
+    });
+  });
+
+  const PullStream$ = new Subject<
+    RxReplicationPullStreamItem<
+      TodoDocType,
+      { id: string; updatedAt: number }
+    >
+  >();
+
+  const eventSource = new EventSource("/api/todos/pullStream", {
+    withCredentials: true,
+  });
+
+  eventSource.onmessage = (event) => {
+    const eventData = JSON.parse(event.data);
+
+    PullStream$.next({
+      documents: eventData.documents,
+      checkpoint: eventData.checkpoint,
+    });
+  };
+
+  eventSource.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+
+    if (data === "RESYNC") {
+      PullStream$.next("RESYNC");
+    } else {
+      PullStream$.next({
+        documents: data.documents,
+        checkpoint: data.checkpoint,
+      });
+    }
+  };
+
+  eventSource.onerror = () => {
+    PullStream$.next("RESYNC");
+  };
+
+  const httpReplicationState = replicateRxCollection({
     collection: database.todos,
     replicationIdentifier: "http-todos",
+    live: true,
     pull: {
       handler: async (lastCheckpoint, batchSize) => {
         try {
@@ -144,34 +198,7 @@ export const databasePromise = (async () => {
           };
         }
       },
-      stream$: new Observable<
-        RxReplicationPullStreamItem<
-          TodoDocType,
-          { id: string; updatedAt: number }
-        >
-      >((subscriber) => {
-        const eventSource = new EventSource("/api/todos/pullStream");
-
-        eventSource.onmessage = (event) => {
-          const data = JSON.parse(event.data);
-          if (data === "RESYNC") {
-            subscriber.next("RESYNC");
-          } else {
-            subscriber.next({
-              documents: data.documents,
-              checkpoint: data.checkpoint,
-            });
-          }
-        };
-
-        eventSource.onerror = () => {
-          subscriber.next("RESYNC");
-        };
-
-        return () => {
-          eventSource.close();
-        };
-      }),
+      stream$: PullStream$.asObservable(),
     },
     push: {
       handler: async (
@@ -206,25 +233,6 @@ export const databasePromise = (async () => {
 
   httpReplicationState.active$.subscribe((active) => {
     console.log("HTTP replication active:", active);
-  });
-
-  const webrtcReplicationState = await replicateWebRTC<
-    TodoDocType,
-    SimplePeer
-  >({
-    collection: database.todos,
-    connectionHandlerCreator: getConnectionHandlerSimplePeer({}),
-    topic: roomHash.substring(0, 10),
-    pull: {},
-    push: {},
-  });
-
-  webrtcReplicationState.error$.subscribe((err) => {
-    console.error("WebRTC replication error:", err);
-  });
-
-  webrtcReplicationState.peerStates$.subscribe((s) => {
-    console.log("new peer states:", s);
   });
 
   return database;
